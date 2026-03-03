@@ -59,7 +59,7 @@ def _patched_forward(
 
         # Capture intermediate layers (not the last) before norm
         if absolute_layer_idx in target_layers:
-            aux_hidden_states.append((hidden_states + residual).clone())
+            aux_hidden_states.append(hidden_states + residual)
 
     # Return early if not last PP rank
     if not get_pp_group().is_last_rank:
@@ -187,7 +187,7 @@ class HiddenStatesWorkerExtension:
         for metadata in self._request_metadata:  # type: ignore[has-type]
             for req_id, num_tok in metadata:
                 for layer_idx, layer_tensor in enumerate(concatenated_layers):
-                    chunk = layer_tensor[current_idx : current_idx + num_tok].clone()
+                    chunk = layer_tensor[current_idx : current_idx + num_tok]
                     request_chunks[req_id][layer_idx].append(chunk)
                 current_idx += num_tok
 
