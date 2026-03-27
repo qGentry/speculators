@@ -10,12 +10,34 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from speculators.data_generation import VllmHiddenStatesGenerator
+from speculators.data_generation.vllm_hidden_states_generator import (
+    _REQUEST_ACCEPTS_EOS_TOKEN_ID,
+    _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID,
+    _make_prefill_request,
+)
 
 logger = logging.getLogger(__name__)
 
 # Set vLLM multiprocessing method to spawn for CUDA compatibility
 # Must be set before vLLM imports to avoid CUDA re-initialization errors
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
+def test_make_prefill_request_is_compatible_with_installed_vllm():
+    req = _make_prefill_request(
+        request_id="req_test",
+        prompt_token_ids=[1, 2, 3],
+        eos_token_id=42,
+        block_hasher=None,
+    )
+
+    assert req.request_id == "req_test"
+    assert req.prompt_token_ids == [1, 2, 3]
+    assert req.max_tokens == 1
+    if _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID:
+        assert req.sampling_params._eos_token_id == 42
+    if not _REQUEST_ACCEPTS_EOS_TOKEN_ID:
+        assert "eos_token_id" not in req.__dict__
 
 
 @pytest.fixture(autouse=True)

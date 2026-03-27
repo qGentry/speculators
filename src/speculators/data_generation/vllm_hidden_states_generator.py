@@ -1,5 +1,6 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
 
+import inspect
 import uuid
 
 import torch
@@ -44,6 +45,42 @@ SAMPLING_TEMPERATURE = 0.0  # Temperature for sampling (greedy)
 INITIAL_ARRIVAL_TIME = 0.0  # Initial request arrival time
 
 log = PipelineLogger(__name__)
+
+_REQUEST_ACCEPTS_EOS_TOKEN_ID = "eos_token_id" in inspect.signature(
+    Request
+).parameters
+_SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID = "_eos_token_id" in inspect.signature(
+    SamplingParams
+).parameters
+
+
+def _make_sampling_params(eos_token_id: int | None) -> SamplingParams:
+    sampling_kwargs = {
+        "max_tokens": MAX_DECODE_TOKENS,
+        "temperature": SAMPLING_TEMPERATURE,
+    }
+    if eos_token_id is not None and _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID:
+        sampling_kwargs["_eos_token_id"] = eos_token_id
+    return SamplingParams(**sampling_kwargs)
+
+
+def _make_prefill_request(
+    request_id: str,
+    prompt_token_ids: list[int],
+    eos_token_id: int | None,
+    block_hasher,
+) -> Request:
+    req_kwargs = {
+        "request_id": request_id,
+        "prompt_token_ids": prompt_token_ids,
+        "sampling_params": _make_sampling_params(eos_token_id),
+        "pooling_params": None,
+        "arrival_time": INITIAL_ARRIVAL_TIME,
+        "block_hasher": block_hasher,
+    }
+    if eos_token_id is not None and _REQUEST_ACCEPTS_EOS_TOKEN_ID:
+        req_kwargs["eos_token_id"] = eos_token_id
+    return Request(**req_kwargs)
 
 
 class VllmHiddenStatesGenerator:
@@ -271,15 +308,10 @@ class VllmHiddenStatesGenerator:
             request_id_to_idx[req_id] = i
             request_id_to_prompt_len[req_id] = len(ids_list)
 
-            req = Request(
+            req = _make_prefill_request(
                 request_id=req_id,
                 prompt_token_ids=ids_list,
-                sampling_params=SamplingParams(
-                    max_tokens=MAX_DECODE_TOKENS, temperature=SAMPLING_TEMPERATURE
-                ),
-                pooling_params=None,
                 eos_token_id=self.tokenizer.eos_token_id,
-                arrival_time=INITIAL_ARRIVAL_TIME,
                 block_hasher=self.block_hasher,
             )
             self.scheduler.add_request(req)
