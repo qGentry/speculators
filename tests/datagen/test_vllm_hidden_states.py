@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 import time
+from unittest import mock
 
 import pytest
 import torch
@@ -38,6 +39,95 @@ def test_make_prefill_request_is_compatible_with_installed_vllm():
         assert req.sampling_params._eos_token_id == 42
     if not _REQUEST_ACCEPTS_EOS_TOKEN_ID:
         assert "eos_token_id" not in req.__dict__
+
+
+def test_validate_parallel_sizes_accepts_matching_expert_parallel_size():
+    VllmHiddenStatesGenerator._validate_parallel_sizes(
+        tensor_parallel_size=4,
+        expert_parallel_size=4,
+    )
+
+
+@pytest.mark.parametrize("expert_parallel_size", [0, -1])
+def test_validate_parallel_sizes_rejects_invalid_expert_parallel_size(
+    expert_parallel_size,
+):
+    with pytest.raises(
+        ValueError, match="expert_parallel_size must be >= 1 when provided"
+    ):
+        VllmHiddenStatesGenerator._validate_parallel_sizes(
+            tensor_parallel_size=4,
+            expert_parallel_size=expert_parallel_size,
+        )
+
+
+def test_validate_parallel_sizes_rejects_mismatched_expert_parallel_size():
+    with pytest.raises(
+        ValueError, match="must match tensor_parallel_size when it is greater than 1"
+    ):
+        VllmHiddenStatesGenerator._validate_parallel_sizes(
+            tensor_parallel_size=8,
+            expert_parallel_size=4,
+        )
+
+
+def test_create_vllm_config_forwards_kv_cache_dtype_and_expert_parallel():
+    generator = object.__new__(VllmHiddenStatesGenerator)
+    generator.max_num_seqs = 8
+    generator.max_batched_tokens = 512
+
+    with (
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.CacheConfig"
+        ) as cache_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.ModelConfig"
+        ) as model_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.ParallelConfig"
+        ) as parallel_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.SchedulerConfig"
+        ) as scheduler_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.DeviceConfig"
+        ) as device_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.LoadConfig"
+        ) as load_config_cls,
+        mock.patch(
+            "speculators.data_generation.vllm_hidden_states_generator.VllmConfig"
+        ) as vllm_config_cls,
+    ):
+        cache_config = mock.sentinel.cache_config
+        model_config = mock.sentinel.model_config
+        parallel_config = mock.sentinel.parallel_config
+        scheduler_config = mock.sentinel.scheduler_config
+        device_config = mock.sentinel.device_config
+        load_config = mock.sentinel.load_config
+        vllm_config = mock.sentinel.vllm_config
+
+        cache_config_cls.return_value = cache_config
+        model_config_cls.return_value = model_config
+        parallel_config_cls.return_value = parallel_config
+        scheduler_config_cls.return_value = scheduler_config
+        device_config_cls.return_value = device_config
+        load_config_cls.return_value = load_config
+        vllm_config_cls.return_value = vllm_config
+
+        result = generator._create_vllm_config(
+            model_path="Qwen/Qwen2-0.5B",
+            max_model_len=2048,
+            gpu_memory_utilization=0.3,
+            tensor_parallel_size=2,
+            kv_cache_dtype="fp8",
+            expert_parallel_size=2,
+        )
+
+    assert result is vllm_config
+    assert cache_config_cls.call_args.kwargs["cache_dtype"] == "fp8"
+    assert parallel_config_cls.call_args.kwargs["tensor_parallel_size"] == 2
+    assert parallel_config_cls.call_args.kwargs["enable_expert_parallel"] is True
 
 
 @pytest.fixture(autouse=True)

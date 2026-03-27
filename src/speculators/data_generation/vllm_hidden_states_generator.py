@@ -118,13 +118,21 @@ class VllmHiddenStatesGenerator:
         max_model_len: int = 2048,
         gpu_memory_utilization: float = 0.8,
         tensor_parallel_size: int = 1,
+        kv_cache_dtype: str = "auto",
+        expert_parallel_size: int | None = None,
         max_num_batched_tokens: int | None = None,
         max_num_seqs: int = MAX_NUM_SEQS,
         max_batched_tokens: int = MIN_MAX_BATCHED_TOKENS,
         output_device: str = "cpu",
     ):
+        self._validate_parallel_sizes(
+            tensor_parallel_size=tensor_parallel_size,
+            expert_parallel_size=expert_parallel_size,
+        )
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.kv_cache_dtype = kv_cache_dtype
+        self.expert_parallel_size = expert_parallel_size
         self._request_counter = 0
         self.max_num_seqs = max_num_seqs
         self.max_batched_tokens = max_batched_tokens
@@ -133,6 +141,11 @@ class VllmHiddenStatesGenerator:
 
         log.info(f"Initializing hidden states generator for {model_path}")
         log.info(f"Tensor parallel size: {tensor_parallel_size}")
+        log.info(f"KV cache dtype: {kv_cache_dtype}")
+        if expert_parallel_size is None:
+            log.info("Expert parallel size: disabled")
+        else:
+            log.info(f"Expert parallel size: {expert_parallel_size}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -167,6 +180,8 @@ class VllmHiddenStatesGenerator:
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
+            kv_cache_dtype=kv_cache_dtype,
+            expert_parallel_size=expert_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
         )
 
@@ -221,18 +236,47 @@ class VllmHiddenStatesGenerator:
             caching_hash_fn,
         )
 
+    @staticmethod
+    def _validate_parallel_sizes(
+        tensor_parallel_size: int,
+        expert_parallel_size: int | None,
+    ) -> None:
+        if tensor_parallel_size < 1:
+            raise ValueError(
+                "tensor_parallel_size must be >= 1. "
+                f"Got {tensor_parallel_size}."
+            )
+        if expert_parallel_size is None:
+            return
+        if expert_parallel_size < 1:
+            raise ValueError(
+                "expert_parallel_size must be >= 1 when provided. "
+                f"Got {expert_parallel_size}."
+            )
+        if expert_parallel_size > 1 and expert_parallel_size != tensor_parallel_size:
+            raise ValueError(
+                "VllmHiddenStatesGenerator currently maps expert parallelism "
+                "onto the tensor-parallel worker group, so expert_parallel_size "
+                "must match tensor_parallel_size when it is greater than 1. "
+                f"Got expert_parallel_size={expert_parallel_size} and "
+                f"tensor_parallel_size={tensor_parallel_size}."
+            )
+
     def _create_vllm_config(
         self,
         model_path: str,
         max_model_len: int,
         gpu_memory_utilization: float,
         tensor_parallel_size: int,
+        kv_cache_dtype: str,
+        expert_parallel_size: int | None,
         max_num_batched_tokens: int | None = None,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
             block_size=VLLM_BLOCK_SIZE,
             gpu_memory_utilization=gpu_memory_utilization,
+            cache_dtype=kv_cache_dtype,
             # disable to prevent cache state leakage
             enable_prefix_caching=False,
         )
@@ -257,6 +301,7 @@ class VllmHiddenStatesGenerator:
             cache_config=cache_config,
             parallel_config=ParallelConfig(
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=expert_parallel_size not in (None, 1),
                 worker_extension_cls="speculators.data_generation.custom_worker.HiddenStatesWorkerExtension",
             ),
             scheduler_config=SchedulerConfig(

@@ -77,6 +77,27 @@ def parse_args():
         default=0.8,
         help="Target GPU memory utilization (default: 0.8)",
     )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="auto",
+        help=(
+            "vLLM KV cache dtype (for example: auto, bfloat16, fp8, fp8_e4m3). "
+            "Passed directly to CacheConfig.cache_dtype."
+        ),
+    )
+    parser.add_argument(
+        "--expert-parallel-size",
+        "--expert-paralleli-size",
+        dest="expert_parallel_size",
+        type=int,
+        default=None,
+        help=(
+            "Enable expert parallelism across this many ranks. "
+            "This generator currently requires it to match "
+            "--tensor-parallel-size when greater than 1."
+        ),
+    )
 
     # Data arguments
     parser.add_argument(
@@ -263,6 +284,8 @@ def generate_and_save_hidden_states(args, dataset):
         max_model_len=args.seq_length,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
+        kv_cache_dtype=args.kv_cache_dtype,
+        expert_parallel_size=args.expert_parallel_size,
         output_device=args.output_device,
     )
 
@@ -337,6 +360,8 @@ def main():
             "Dataset": args.train_data_path,
             "Output Dir": args.output_dir,
             "Tensor Parallel": args.tensor_parallel_size,
+            "KV Cache DType": args.kv_cache_dtype,
+            "Expert Parallel Size": args.expert_parallel_size,
             "Batch Size": args.batch_size,
             "Output Device": args.output_device,
         }

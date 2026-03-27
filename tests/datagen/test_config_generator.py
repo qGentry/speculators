@@ -23,6 +23,8 @@ def mock_vllm_generator():
     generator.model_path = "meta-llama/Llama-3.1-8B-Instruct"
     generator.layer_ids = [2, 16, 29, 31]
     generator.tensor_parallel_size = 1
+    generator.kv_cache_dtype = "fp8"
+    generator.expert_parallel_size = 1
     generator.vllm_config.cache_config.gpu_memory_utilization = 0.8
     return generator
 
@@ -104,6 +106,11 @@ def test_config_from_generator_extracts_all_settings(
     assert config.model.target_model_path == mock_vllm_generator.model_path
     assert config.hidden_states.layer_ids == mock_vllm_generator.layer_ids
     assert config.model.tensor_parallel_size == mock_vllm_generator.tensor_parallel_size
+    assert config.model.kv_cache_dtype == mock_vllm_generator.kv_cache_dtype
+    assert (
+        config.model.expert_parallel_size
+        == mock_vllm_generator.expert_parallel_size
+    )
 
 
 @pytest.mark.smoke

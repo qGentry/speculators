@@ -86,6 +86,8 @@ class ModelConfig:
     target_model_path: str
     tensor_parallel_size: int
     gpu_memory_utilization: float
+    kv_cache_dtype: str
+    expert_parallel_size: int | None
     hidden_size: int
 
 
@@ -239,6 +241,12 @@ class DataGenerationConfig:
                 target_model_path=generator.model_path,
                 tensor_parallel_size=generator.tensor_parallel_size,
                 gpu_memory_utilization=generator.vllm_config.cache_config.gpu_memory_utilization,
+                kv_cache_dtype=getattr(
+                    generator,
+                    "kv_cache_dtype",
+                    generator.vllm_config.cache_config.cache_dtype,
+                ),
+                expert_parallel_size=getattr(generator, "expert_parallel_size", None),
                 hidden_size=hidden_size,
             ),
             data=DataConfig(
