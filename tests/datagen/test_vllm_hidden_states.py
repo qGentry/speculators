@@ -9,11 +9,18 @@ from unittest import mock
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
+from vllm.v1.core.kv_cache_utils import (
+    _get_kv_cache_groups_uniform_spec,
+    unify_hybrid_kv_cache_specs,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from speculators.data_generation import VllmHiddenStatesGenerator
 from speculators.data_generation.vllm_hidden_states_generator import (
     _REQUEST_ACCEPTS_EOS_TOKEN_ID,
     _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID,
+    _get_kv_cache_groups_for_scheduler,
     _make_prefill_request,
 )
 
@@ -128,6 +135,59 @@ def test_create_vllm_config_forwards_kv_cache_dtype_and_expert_parallel():
     assert cache_config_cls.call_args.kwargs["cache_dtype"] == "fp8"
     assert parallel_config_cls.call_args.kwargs["tensor_parallel_size"] == 2
     assert parallel_config_cls.call_args.kwargs["enable_expert_parallel"] is True
+
+
+def _make_attention_mamba_kv_cache_spec():
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    return {
+        "layers.0.self_attn": full_attention_spec,
+        "layers.1.mamba": MambaSpec(
+            block_size=16,
+            shapes=((16, 128),),
+            dtypes=(torch.float16,),
+            page_size_padded=full_attention_spec.page_size_bytes,
+        ),
+    }
+
+
+def _force_uniform_kv_cache_grouping(kv_cache_spec):
+    unify_hybrid_kv_cache_specs(kv_cache_spec)
+    return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+
+
+def test_forced_uniform_kv_cache_grouping_reproduces_attention_mamba_failure():
+    with pytest.raises(ValueError, match="failed to convert the KV cache specs"):
+        _force_uniform_kv_cache_grouping(_make_attention_mamba_kv_cache_spec())
+
+
+def test_kv_cache_grouping_supports_attention_mamba_without_loading_weights():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            disable_hybrid_kv_cache_manager=False,
+        ),
+    )
+
+    kv_cache_groups = _get_kv_cache_groups_for_scheduler(
+        vllm_config,
+        _make_attention_mamba_kv_cache_spec(),
+    )
+
+    assert len(kv_cache_groups) == 2
+    assert {type(group.kv_cache_spec) for group in kv_cache_groups} == {
+        FullAttentionSpec,
+        MambaSpec,
+    }
+    assert {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups} == {
+        65536
+    }
 
 
 @pytest.fixture(autouse=True)
