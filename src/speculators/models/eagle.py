@@ -333,7 +333,11 @@ class EagleSpeculator(SpeculatorModel):
         # Initialize model parameters from config
         self.vocab_size = config.transformer_layer_config.vocab_size
         self.hidden_size = config.transformer_layer_config.hidden_size
-        self.padding_idx = config.transformer_layer_config.pad_token_id
+        self.padding_idx = getattr(
+            config.transformer_layer_config,
+            "pad_token_id",
+            None,
+        )
 
         # Set layers pulled from the verifier to None until attach is called
         self.embed_tokens: nn.Embedding | None = None

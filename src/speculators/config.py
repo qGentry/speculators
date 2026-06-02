@@ -22,10 +22,16 @@ import os
 from importlib.metadata import version
 from typing import Any, ClassVar
 
+import torch
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import PretrainedConfig
+from transformers import configuration_utils as transformers_configuration_utils
 
 from speculators.utils import PydanticClassRegistryMixin, ReloadableBaseModel
+
+# Transformers 5.x references torch in PretrainedConfig annotations without
+# binding it at runtime; Pydantic needs the name during schema rebuilds.
+transformers_configuration_utils.torch = torch
 
 __all__ = [
     "SpeculatorModelConfig",
@@ -171,6 +177,17 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     This is the main config which maps to the config.json file for saved speculators.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        init = cls.__dict__.get("__init__")
+        if init is not None and init.__code__.co_filename == (
+            transformers_configuration_utils.__file__
+        ):
+            # Transformers 5.x dataclass init touches Pydantic fields before
+            # BaseModel initializes its internal state.
+            cls.__init__ = SpeculatorModelConfig.__init__
+
     @classmethod
     def from_pretrained(
         cls,
@@ -292,6 +309,9 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
 
         # ensure we always update the transformers version
         self.transformers_version = version("transformers")
+
+    def validate(self) -> None:
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         """
