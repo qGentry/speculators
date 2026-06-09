@@ -26,6 +26,7 @@ from speculators.data_generation.custom_worker import HiddenStatesWorkerExtensio
 from speculators.data_generation.vllm_hidden_states_generator import (
     _REQUEST_ACCEPTS_EOS_TOKEN_ID,
     _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID,
+    _get_cache_memory_budget,
     _get_kv_cache_configs_for_scheduler,
     _get_kv_cache_groups_for_scheduler,
     _make_prefill_request,
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 # Set vLLM multiprocessing method to spawn for CUDA compatibility
 # Must be set before vLLM imports to avoid CUDA re-initialization errors
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
+def test_cache_memory_budget_is_controlled_by_gpu_memory_utilization():
+    assert _get_cache_memory_budget(1000, 0.3) == 300
 
 
 def test_make_prefill_request_is_compatible_with_installed_vllm():
@@ -150,7 +155,15 @@ def test_hidden_states_extension_uses_deepseek_v4_post_norm_forward(monkeypatch)
             super().__init__()
             self.increment = increment
 
-        def forward(self, hidden_states, positions, input_ids):
+        def forward(
+            self,
+            hidden_states,
+            positions,
+            input_ids,
+            post_mix=None,
+            res_mix=None,
+            residual=None,
+        ):
             return hidden_states + self.increment
 
     class DeepseekV4Model(torch.nn.Module):
@@ -178,6 +191,11 @@ def test_hidden_states_extension_uses_deepseek_v4_post_norm_forward(monkeypatch)
     )
     monkeypatch.setattr(
         custom_worker,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        custom_worker,
         "_deepseek_v4_post_norm_hidden_states",
         lambda _base_model, hidden_states: hidden_states.squeeze(-2) + 1000.0,
     )
@@ -198,6 +216,88 @@ def test_hidden_states_extension_uses_deepseek_v4_post_norm_forward(monkeypatch)
     assert torch.equal(
         extension._captured_states[1][0],
         torch.tensor([[1061.0], [1062.0]]),
+    )
+
+
+def test_deepseek_v4_forward_supports_threaded_layer_state(monkeypatch):
+    class FakeLayer(torch.nn.Module):
+        def __init__(self, increment):
+            super().__init__()
+            self.increment = increment
+
+        def forward(
+            self,
+            hidden_states,
+            positions,
+            input_ids,
+            post_mix=None,
+            res_mix=None,
+            residual=None,
+        ):
+            assert not isinstance(hidden_states, tuple)
+            if residual is None:
+                residual = torch.zeros_like(hidden_states)
+            if post_mix is None:
+                post_mix = torch.full_like(hidden_states, 100.0)
+            if res_mix is None:
+                res_mix = torch.full_like(hidden_states, 1000.0)
+            return (
+                hidden_states + self.increment,
+                residual + 1.0,
+                post_mix + 2.0,
+                res_mix + 3.0,
+            )
+
+        def hc_post(self, hidden_states, residual, post_mix, res_mix):
+            return hidden_states + residual + post_mix + res_mix
+
+    class DeepseekV4Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type="deepseek_v4")
+            self.hc_mult = 1
+            self.start_layer = 0
+            self.end_layer = 2
+            self.layers = torch.nn.ModuleList([FakeLayer(10.0), FakeLayer(20.0)])
+            self._mtp_hidden_buffer = torch.zeros(8, 1)
+
+        def embed_input_ids(self, input_ids):
+            return input_ids.to(torch.float32).unsqueeze(-1)
+
+    base_model = DeepseekV4Model()
+    extension = HiddenStatesWorkerExtension()
+    extension.model_runner = SimpleNamespace(model=SimpleNamespace(model=base_model))
+    monkeypatch.setattr(
+        custom_worker,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        custom_worker,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        custom_worker,
+        "_deepseek_v4_post_norm_hidden_states",
+        lambda _base_model, hidden_states: hidden_states.squeeze(-2) + 1000.0,
+    )
+
+    extension._setup_hidden_states_capture([0])
+    output = base_model.forward(
+        input_ids=torch.tensor([1.0, 2.0]),
+        positions=torch.tensor([0, 1]),
+    )
+
+    assert torch.equal(output, torch.tensor([[2143.0], [2144.0]]))
+    assert torch.equal(
+        base_model._mtp_hidden_buffer[:2],
+        torch.tensor([[1143.0], [1144.0]]),
+    )
+    assert len(extension._captured_states) == 1
+    assert torch.equal(
+        extension._captured_states[0][0],
+        torch.tensor([[2117.0], [2118.0]]),
     )
 
 

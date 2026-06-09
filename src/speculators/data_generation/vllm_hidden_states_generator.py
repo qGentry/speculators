@@ -38,7 +38,7 @@ from .logging_utils import PipelineLogger
 __all__ = ["VllmHiddenStatesGenerator"]
 
 # Constants
-CACHE_MEMORY_FRACTION = 0.2  # Fraction of GPU memory for KV cache
+CACHE_MEMORY_FRACTION = 1.0  # Let gpu_memory_utilization fully control KV budget.
 VLLM_BLOCK_SIZE = 128 if is_npu_available() else 16  # Block size for KV cache
 MAX_NUM_SEQS = 32  # Maximum sequences for prefill-only workload
 MIN_MAX_BATCHED_TOKENS = 8192  # Minimum batched tokens threshold
@@ -138,6 +138,10 @@ def _validate_vllm_config_override_kwargs(
             f"{target!r}: {sorted(unexpected_keys)}. Expected one of "
             f"{sorted(valid_keys)}."
         )
+
+
+def _get_cache_memory_budget(free_memory: int, gpu_memory_utilization: float) -> int:
+    return int(free_memory * gpu_memory_utilization * CACHE_MEMORY_FRACTION)
 
 
 def _make_sampling_params(eos_token_id: int | None) -> SamplingParams:
@@ -307,7 +311,7 @@ class VllmHiddenStatesGenerator:
         kv_cache_spec_list = self.executor.collective_rpc("get_kv_cache_spec")
 
         free_memory, _ = mem_get_info()
-        cache_memory = int(free_memory * gpu_memory_utilization * CACHE_MEMORY_FRACTION)
+        cache_memory = _get_cache_memory_budget(free_memory, gpu_memory_utilization)
 
         kv_cache_configs, scheduler_kv_cache_config = (
             _get_kv_cache_configs_for_scheduler(
