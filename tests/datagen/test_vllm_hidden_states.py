@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -16,7 +17,8 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from speculators.data_generation import VllmHiddenStatesGenerator
+from speculators.data_generation import VllmHiddenStatesGenerator, custom_worker
+from speculators.data_generation.custom_worker import HiddenStatesWorkerExtension
 from speculators.data_generation.vllm_hidden_states_generator import (
     _REQUEST_ACCEPTS_EOS_TOKEN_ID,
     _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID,
@@ -135,6 +137,63 @@ def test_create_vllm_config_forwards_kv_cache_dtype_and_expert_parallel():
     assert cache_config_cls.call_args.kwargs["cache_dtype"] == "fp8"
     assert parallel_config_cls.call_args.kwargs["tensor_parallel_size"] == 2
     assert parallel_config_cls.call_args.kwargs["enable_expert_parallel"] is True
+
+
+def test_hidden_states_extension_uses_deepseek_v4_post_norm_forward(monkeypatch):
+    class FakeLayer(torch.nn.Module):
+        def __init__(self, increment):
+            super().__init__()
+            self.increment = increment
+
+        def forward(self, hidden_states, positions, input_ids):
+            return hidden_states + self.increment
+
+    class DeepseekV4Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type="deepseek_v4")
+            self.hc_mult = 1
+            self.start_layer = 0
+            self.end_layer = 3
+            self.layers = torch.nn.ModuleList(
+                [FakeLayer(10.0), FakeLayer(20.0), FakeLayer(30.0)]
+            )
+            self._mtp_hidden_buffer = torch.zeros(8, 1)
+
+        def embed_input_ids(self, input_ids):
+            return input_ids.to(torch.float32).unsqueeze(-1)
+
+    base_model = DeepseekV4Model()
+    extension = HiddenStatesWorkerExtension()
+    extension.model_runner = SimpleNamespace(model=SimpleNamespace(model=base_model))
+    monkeypatch.setattr(
+        custom_worker,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        custom_worker,
+        "_deepseek_v4_post_norm_hidden_states",
+        lambda _base_model, hidden_states: hidden_states.squeeze(-2) + 1000.0,
+    )
+
+    extension._setup_hidden_states_capture([0, 2])
+    output = base_model.forward(
+        input_ids=torch.tensor([1.0, 2.0]),
+        positions=torch.tensor([0, 1]),
+    )
+
+    assert base_model.forward.__func__ is custom_worker._patched_deepseek_v4_forward
+    assert torch.equal(output, torch.tensor([[1061.0], [1062.0]]))
+    assert len(extension._captured_states) == 2
+    assert torch.equal(
+        extension._captured_states[0][0],
+        torch.tensor([[1011.0], [1012.0]]),
+    )
+    assert torch.equal(
+        extension._captured_states[1][0],
+        torch.tensor([[1061.0], [1062.0]]),
+    )
 
 
 def _make_attention_mamba_kv_cache_spec():
@@ -541,13 +600,13 @@ def test_output_device_cuda_matches_cpu(model_path, tensor_parallel_size):
         max_length=1024,
     )["input_ids"].tolist()
 
-    common_kwargs = dict(
-        model_path=model_path,
-        layer_ids=[2],
-        max_model_len=1024,
-        gpu_memory_utilization=0.3,
-        tensor_parallel_size=tensor_parallel_size,
-    )
+    common_kwargs = {
+        "model_path": model_path,
+        "layer_ids": [2],
+        "max_model_len": 1024,
+        "gpu_memory_utilization": 0.3,
+        "tensor_parallel_size": tensor_parallel_size,
+    }
 
     cpu_generator = VllmHiddenStatesGenerator(output_device="cpu", **common_kwargs)
     try:

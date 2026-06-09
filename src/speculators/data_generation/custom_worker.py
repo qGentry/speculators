@@ -74,6 +74,63 @@ def _patched_forward(
     return hidden_states
 
 
+def _is_deepseek_v4_model(base_model) -> bool:
+    config = getattr(base_model, "config", None)
+    return (
+        type(base_model).__name__ == "DeepseekV4Model"
+        or getattr(config, "model_type", None) == "deepseek_v4"
+    )
+
+
+def _deepseek_v4_post_norm_hidden_states(base_model, hidden_states):
+    from vllm.model_executor.models.deepseek_v4 import hc_head
+
+    hidden_states = hc_head(
+        hidden_states,
+        base_model.hc_head_fn,
+        base_model.hc_head_scale,
+        base_model.hc_head_base,
+        base_model.rms_norm_eps,
+        base_model.hc_eps,
+    )
+    return base_model.norm(hidden_states)
+
+
+def _patched_deepseek_v4_forward(
+    self,
+    input_ids,
+    positions,
+    _intermediate_tensors=None,
+    _inputs_embeds=None,
+    **_kwargs,
+):
+    hidden_states = self.embed_input_ids(input_ids)
+    hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+
+    aux_hidden_states = []
+    extension = self._extension  # noqa: SLF001
+    should_capture = get_tp_group().rank_in_group == 0
+    target_layers = extension._layer_ids if should_capture else frozenset()  # noqa: SLF001
+
+    for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+        hidden_states = layer(hidden_states, positions, input_ids)
+        absolute_layer_idx = self.start_layer + idx
+
+        if absolute_layer_idx in target_layers:
+            aux_hidden_states.append(
+                _deepseek_v4_post_norm_hidden_states(self, hidden_states)
+            )
+
+    num_tokens = hidden_states.shape[0]
+    self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+    hidden_states = _deepseek_v4_post_norm_hidden_states(self, hidden_states)
+
+    if should_capture and aux_hidden_states:
+        extension._store_captured_states(aux_hidden_states)  # noqa: SLF001
+
+    return hidden_states
+
+
 class HiddenStatesWorkerExtension:
     """Worker extension that adds hidden states capture functionality.
 
@@ -135,7 +192,13 @@ class HiddenStatesWorkerExtension:
             )
 
         base_model._extension = self  # noqa: SLF001
-        base_model.forward = types.MethodType(_patched_forward, base_model)
+        if _is_deepseek_v4_model(base_model):
+            base_model.forward = types.MethodType(
+                _patched_deepseek_v4_forward,
+                base_model,
+            )
+        else:
+            base_model.forward = types.MethodType(_patched_forward, base_model)
         logger.info(f"Hidden states capture setup complete for layers {layer_ids}")
 
     def _set_request_metadata(self, request_metadata: dict[str, int]):

@@ -362,7 +362,8 @@ class VllmHiddenStatesGenerator:
             )
 
     def _get_vllm_config_override_kwargs(self, target: str) -> dict[str, Any]:
-        kwargs = dict(self.vllm_config_overrides.get(target, {}))
+        overrides = getattr(self, "vllm_config_overrides", {})
+        kwargs = dict(overrides.get(target, {}))
         _validate_vllm_config_override_kwargs(target, kwargs)
         return kwargs
 
