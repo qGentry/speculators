@@ -2,6 +2,7 @@
 
 import inspect
 import uuid
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -52,6 +53,90 @@ _REQUEST_ACCEPTS_EOS_TOKEN_ID = "eos_token_id" in inspect.signature(
 _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID = "_eos_token_id" in inspect.signature(
     SamplingParams
 ).parameters
+_VLLM_CONFIG_OVERRIDE_TARGETS = {
+    "model": ModelConfig,
+    "cache": CacheConfig,
+    "parallel": ParallelConfig,
+    "scheduler": SchedulerConfig,
+    "device": DeviceConfig,
+    "load": LoadConfig,
+    "vllm": VllmConfig,
+    "scheduler_init": Scheduler,
+}
+_PROTECTED_VLLM_CONFIG_OVERRIDE_KEYS = {
+    "model": {"model", "tokenizer", "max_model_len"},
+    "cache": {"enable_prefix_caching"},
+    "parallel": {
+        "tensor_parallel_size",
+        "enable_expert_parallel",
+        "worker_extension_cls",
+    },
+    "scheduler": {"max_model_len", "is_encoder_decoder"},
+    "vllm": {
+        "model_config",
+        "cache_config",
+        "parallel_config",
+        "scheduler_config",
+        "device_config",
+        "load_config",
+    },
+    "scheduler_init": {
+        "vllm_config",
+        "kv_cache_config",
+        "structured_output_manager",
+        "block_size",
+    },
+}
+
+
+def _normalize_vllm_config_overrides(
+    overrides: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    if overrides is None:
+        return {}
+
+    unexpected_targets = set(overrides) - set(_VLLM_CONFIG_OVERRIDE_TARGETS)
+    if unexpected_targets:
+        raise ValueError(
+            "Unexpected vLLM config override target(s): "
+            f"{sorted(unexpected_targets)}. Expected one of "
+            f"{sorted(_VLLM_CONFIG_OVERRIDE_TARGETS)}."
+        )
+
+    normalized = {}
+    for target, kwargs in overrides.items():
+        if not isinstance(kwargs, dict):
+            raise TypeError(
+                "vLLM config override values must be dictionaries. "
+                f"Got {type(kwargs).__name__} for target {target!r}."
+            )
+        normalized[target] = dict(kwargs)
+    return normalized
+
+
+def _validate_vllm_config_override_kwargs(
+    target: str,
+    kwargs: dict[str, Any],
+) -> None:
+    target_cls = _VLLM_CONFIG_OVERRIDE_TARGETS[target]
+    protected_keys = _PROTECTED_VLLM_CONFIG_OVERRIDE_KEYS.get(target, set()) & set(
+        kwargs
+    )
+    if protected_keys:
+        raise ValueError(
+            "vLLM config override target "
+            f"{target!r} cannot override hidden-state generator owned key(s): "
+            f"{sorted(protected_keys)}."
+        )
+
+    valid_keys = set(inspect.signature(target_cls).parameters)
+    unexpected_keys = set(kwargs) - valid_keys
+    if unexpected_keys:
+        raise ValueError(
+            "Unexpected vLLM config override key(s) for "
+            f"{target!r}: {sorted(unexpected_keys)}. Expected one of "
+            f"{sorted(valid_keys)}."
+        )
 
 
 def _make_sampling_params(eos_token_id: int | None) -> SamplingParams:
@@ -118,7 +203,7 @@ class VllmHiddenStatesGenerator:
             hidden_states = result["hidden_states"]  # List of tensors per layer`
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         model_path: str,
         layer_ids: list[int] | None = None,
@@ -130,8 +215,12 @@ class VllmHiddenStatesGenerator:
         max_num_batched_tokens: int | None = None,
         max_num_seqs: int = MAX_NUM_SEQS,
         max_batched_tokens: int = MIN_MAX_BATCHED_TOKENS,
+        vllm_config_overrides: dict[str, dict[str, Any]] | None = None,
         output_device: str = "cpu",
     ):
+        self.vllm_config_overrides = _normalize_vllm_config_overrides(
+            vllm_config_overrides
+        )
         self._validate_parallel_sizes(
             tensor_parallel_size=tensor_parallel_size,
             expert_parallel_size=expert_parallel_size,
@@ -191,6 +280,7 @@ class VllmHiddenStatesGenerator:
             expert_parallel_size=expert_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
         )
+        self.block_size = self.vllm_config.cache_config.block_size
 
         log.info("Initializing executor...")
         self.executor = MultiprocExecutor(vllm_config=self.vllm_config)
@@ -220,12 +310,14 @@ class VllmHiddenStatesGenerator:
             vllm_config=self.vllm_config
         )
 
-        self.scheduler = Scheduler(
-            vllm_config=self.vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=structured_output_manager,
-            block_size=VLLM_BLOCK_SIZE,
-        )
+        scheduler_kwargs = {
+            "vllm_config": self.vllm_config,
+            "kv_cache_config": kv_cache_config,
+            "structured_output_manager": structured_output_manager,
+            "block_size": self.vllm_config.cache_config.block_size,
+        }
+        scheduler_kwargs.update(self._get_vllm_config_override_kwargs("scheduler_init"))
+        self.scheduler = Scheduler(**scheduler_kwargs)
 
         log.info("Initializing KV cache on all workers...")
         kv_cache_configs = [kv_cache_config] * tensor_parallel_size
@@ -269,6 +361,11 @@ class VllmHiddenStatesGenerator:
                 f"tensor_parallel_size={tensor_parallel_size}."
             )
 
+    def _get_vllm_config_override_kwargs(self, target: str) -> dict[str, Any]:
+        kwargs = dict(self.vllm_config_overrides.get(target, {}))
+        _validate_vllm_config_override_kwargs(target, kwargs)
+        return kwargs
+
     def _create_vllm_config(
         self,
         model_path: str,
@@ -280,13 +377,14 @@ class VllmHiddenStatesGenerator:
         max_num_batched_tokens: int | None = None,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
-        cache_config = CacheConfig(
-            block_size=VLLM_BLOCK_SIZE,
-            gpu_memory_utilization=gpu_memory_utilization,
-            cache_dtype=kv_cache_dtype,
-            # disable to prevent cache state leakage
-            enable_prefix_caching=False,
-        )
+        cache_config_kwargs = {
+            "block_size": VLLM_BLOCK_SIZE,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "cache_dtype": kv_cache_dtype,
+            "enable_prefix_caching": False,
+        }
+        cache_config_kwargs.update(self._get_vllm_config_override_kwargs("cache"))
+        cache_config = CacheConfig(**cache_config_kwargs)
 
         # For prefill-only workloads, use conservative scheduler limits
         # to reduce warmup memory allocation. max_num_seqs controls the
@@ -296,30 +394,52 @@ class VllmHiddenStatesGenerator:
         if not max_num_batched_tokens:
             max_num_batched_tokens = max(self.max_batched_tokens, max_model_len)
 
-        return VllmConfig(
-            model_config=ModelConfig(
-                model=model_path,
-                tokenizer=model_path,
-                trust_remote_code=True,
-                dtype="auto",
-                max_model_len=max_model_len,
-                enforce_eager=True,
+        model_config_kwargs = {
+            "model": model_path,
+            "tokenizer": model_path,
+            "trust_remote_code": True,
+            "dtype": "auto",
+            "max_model_len": max_model_len,
+            "enforce_eager": True,
+        }
+        model_config_kwargs.update(self._get_vllm_config_override_kwargs("model"))
+
+        parallel_config_kwargs = {
+            "tensor_parallel_size": tensor_parallel_size,
+            "enable_expert_parallel": expert_parallel_size not in (None, 1),
+            "worker_extension_cls": (
+                "speculators.data_generation.custom_worker."
+                "HiddenStatesWorkerExtension"
             ),
-            cache_config=cache_config,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tensor_parallel_size,
-                enable_expert_parallel=expert_parallel_size not in (None, 1),
-                worker_extension_cls="speculators.data_generation.custom_worker.HiddenStatesWorkerExtension",
-            ),
-            scheduler_config=SchedulerConfig(
-                max_num_seqs=max_num_seqs,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=max_num_batched_tokens,
-                is_encoder_decoder=False,
-            ),
-            device_config=DeviceConfig(),
-            load_config=LoadConfig(),
+        }
+        parallel_config_kwargs.update(
+            self._get_vllm_config_override_kwargs("parallel")
         )
+
+        scheduler_config_kwargs = {
+            "max_num_seqs": max_num_seqs,
+            "max_model_len": max_model_len,
+            "max_num_batched_tokens": max_num_batched_tokens,
+            "is_encoder_decoder": False,
+        }
+        scheduler_config_kwargs.update(
+            self._get_vllm_config_override_kwargs("scheduler")
+        )
+
+        vllm_config_kwargs = {
+            "model_config": ModelConfig(**model_config_kwargs),
+            "cache_config": cache_config,
+            "parallel_config": ParallelConfig(**parallel_config_kwargs),
+            "scheduler_config": SchedulerConfig(**scheduler_config_kwargs),
+            "device_config": DeviceConfig(
+                **self._get_vllm_config_override_kwargs("device")
+            ),
+            "load_config": LoadConfig(
+                **self._get_vllm_config_override_kwargs("load")
+            ),
+        }
+        vllm_config_kwargs.update(self._get_vllm_config_override_kwargs("vllm"))
+        return VllmConfig(**vllm_config_kwargs)
 
     def _setup_capture(self):
         self.executor.collective_rpc(
@@ -417,7 +537,9 @@ class VllmHiddenStatesGenerator:
         imported_devices: set[int] = set()
         if self._use_torch_cuda_ipc:
             # Get captured states organized by request ID using torch CUDA IPC.
-            capture_token = f"capture_{self._request_counter - 1}_{uuid.uuid4().hex[:8]}"
+            capture_token = (
+                f"capture_{self._request_counter - 1}_{uuid.uuid4().hex[:8]}"
+            )
             request_states_payload = self.executor.collective_rpc(
                 "_get_captured_states",
                 args=(capture_token,),
@@ -471,9 +593,10 @@ class VllmHiddenStatesGenerator:
                     else:
                         # Avoid an extra clone when transferring between devices.
                         layer_states.append(h.to(self.output_device))
-                input_ids_tensor = torch.as_tensor(input_ids_list[i], dtype=torch.long).to(
-                    self.output_device
-                )
+                input_ids_tensor = torch.as_tensor(
+                    input_ids_list[i],
+                    dtype=torch.long,
+                ).to(self.output_device)
 
                 results[i] = {
                     "input_ids": input_ids_tensor,
@@ -482,7 +605,9 @@ class VllmHiddenStatesGenerator:
                 }
 
             if any(result is None for result in results):
-                missing_indices = [idx for idx, result in enumerate(results) if result is None]
+                missing_indices = [
+                    idx for idx, result in enumerate(results) if result is None
+                ]
                 raise RuntimeError(
                     f"Missing hidden-state results for batch indices: {missing_indices}"
                 )
