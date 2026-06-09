@@ -18,7 +18,8 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import (
-    get_kv_cache_config_from_groups,
+    generate_scheduler_kv_cache_config,
+    get_kv_cache_configs,
     get_kv_cache_groups,
     get_request_block_hasher,
     init_none_hash,
@@ -175,6 +176,20 @@ def _get_kv_cache_groups_for_scheduler(
     return get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
+def _get_kv_cache_configs_for_scheduler(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> tuple[Any, Any]:
+    kv_cache_configs = get_kv_cache_configs(
+        vllm_config=vllm_config,
+        kv_cache_specs=kv_cache_specs,
+        available_memory=available_memory,
+    )
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    return kv_cache_configs, scheduler_kv_cache_config
+
+
 class VllmHiddenStatesGenerator:
     """Extracts hidden states from intermediate layers during prefill only.
 
@@ -290,29 +305,36 @@ class VllmHiddenStatesGenerator:
 
         log.info("Creating scheduler...")
         kv_cache_spec_list = self.executor.collective_rpc("get_kv_cache_spec")
-        kv_cache_spec = kv_cache_spec_list[0]
-        kv_cache_groups = _get_kv_cache_groups_for_scheduler(
-            self.vllm_config,
-            kv_cache_spec,
-        )
 
         free_memory, _ = mem_get_info()
         cache_memory = int(free_memory * gpu_memory_utilization * CACHE_MEMORY_FRACTION)
 
-        kv_cache_config = get_kv_cache_config_from_groups(
-            vllm_config=self.vllm_config,
-            kv_cache_groups=kv_cache_groups,
-            available_memory=cache_memory,
+        kv_cache_configs, scheduler_kv_cache_config = (
+            _get_kv_cache_configs_for_scheduler(
+                vllm_config=self.vllm_config,
+                kv_cache_specs=kv_cache_spec_list,
+                available_memory=[cache_memory] * len(kv_cache_spec_list),
+            )
         )
 
-        self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.vllm_config.cache_config.num_gpu_blocks = (
+            scheduler_kv_cache_config.num_blocks
+        )
+        kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
+        if kv_cache_groups:
+            self.vllm_config.cache_config.block_size = min(
+                group.kv_cache_spec.block_size for group in kv_cache_groups
+            )
+        self.block_size = self.vllm_config.cache_config.block_size
+        self.vllm_config.validate_block_size()
+
         structured_output_manager = StructuredOutputManager(
             vllm_config=self.vllm_config
         )
 
         scheduler_kwargs = {
             "vllm_config": self.vllm_config,
-            "kv_cache_config": kv_cache_config,
+            "kv_cache_config": scheduler_kv_cache_config,
             "structured_output_manager": structured_output_manager,
             "block_size": self.vllm_config.cache_config.block_size,
         }
@@ -320,7 +342,6 @@ class VllmHiddenStatesGenerator:
         self.scheduler = Scheduler(**scheduler_kwargs)
 
         log.info("Initializing KV cache on all workers...")
-        kv_cache_configs = [kv_cache_config] * tensor_parallel_size
         self.executor.initialize_from_config(kv_cache_configs)
 
         # Create block hasher for request KV cache management

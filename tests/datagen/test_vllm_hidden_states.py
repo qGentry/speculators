@@ -10,18 +10,23 @@ from unittest import mock
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_groups_uniform_spec,
     unify_hybrid_kv_cache_specs,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from speculators.data_generation import VllmHiddenStatesGenerator, custom_worker
 from speculators.data_generation.custom_worker import HiddenStatesWorkerExtension
 from speculators.data_generation.vllm_hidden_states_generator import (
     _REQUEST_ACCEPTS_EOS_TOKEN_ID,
     _SAMPLING_PARAMS_ACCEPTS_PRIVATE_EOS_TOKEN_ID,
+    _get_kv_cache_configs_for_scheduler,
     _get_kv_cache_groups_for_scheduler,
     _make_prefill_request,
 )
@@ -247,6 +252,54 @@ def test_kv_cache_grouping_supports_attention_mamba_without_loading_weights():
     assert {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups} == {
         65536
     }
+
+
+def test_scheduler_kv_cache_config_projects_uniform_type_specs():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        parallel_config=ParallelConfig(),
+        scheduler_config=SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            disable_hybrid_kv_cache_manager=False,
+        ),
+    )
+    vllm_config.model_config = SimpleNamespace(
+        original_max_model_len=128,
+        max_model_len=128,
+    )
+
+    kv_cache_specs = [
+        {
+            "layers.0.self_attn": FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=16,
+                dtype=torch.float16,
+            ),
+            "layers.1.self_attn": FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=16,
+                dtype=torch.float16,
+            ),
+        }
+    ]
+
+    kv_cache_configs, scheduler_kv_cache_config = _get_kv_cache_configs_for_scheduler(
+        vllm_config=vllm_config,
+        kv_cache_specs=kv_cache_specs,
+        available_memory=[1024 * 1024 * 1024],
+    )
+
+    assert isinstance(
+        kv_cache_configs[0].kv_cache_groups[0].kv_cache_spec,
+        UniformTypeKVCacheSpecs,
+    )
+    assert isinstance(
+        scheduler_kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+        FullAttentionSpec,
+    )
 
 
 @pytest.fixture(autouse=True)
